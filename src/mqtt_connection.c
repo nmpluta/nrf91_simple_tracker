@@ -8,8 +8,10 @@
 #include <nrf_modem_at.h>
 #include <zephyr/logging/log.h>
 #include <dk_buttons_and_leds.h>
+#include <modem/modem_key_mgmt.h>
 
 #include "mqtt_connection.h"
+#include "certificate.h"
 
 LOG_MODULE_DECLARE(nrf91_simple_tracker, LOG_LEVEL_INF);
 
@@ -115,7 +117,7 @@ static int get_received_payload(struct mqtt_client * p_client, size_t length)
 }
 
 /**@brief Function to print strings without null-termination
- * 
+ *
  * @param[in] prefix String to print
  */
 static void data_print(uint8_t * prefix, uint8_t * data, size_t len)
@@ -381,8 +383,27 @@ int client_init(struct mqtt_client * p_client)
     p_client->tx_buf = tx_buffer;
     p_client->tx_buf_size = sizeof(tx_buffer);
 
-    /* Disable TLS. */
-    p_client->transport.type = MQTT_TRANSPORT_NON_SECURE;
+    /* Enable TLS. */
+    LOG_INF("Enabling TLS");
+    p_client->transport.type = MQTT_TRANSPORT_SECURE;
+
+    struct mqtt_sec_config * tls_config = &(p_client->transport).tls.config;
+    static sec_tag_t sec_tag_list[] = {
+        CONFIG_MQTT_TLS_SEC_TAG,
+    };
+
+    /* Set the security configuration for the MQTT client. */
+    tls_config->peer_verify = CONFIG_MQTT_TLS_PEER_VERIFY;
+    tls_config->cipher_count = 0;
+    tls_config->cipher_list = NULL;
+    tls_config->sec_tag_count = ARRAY_SIZE(sec_tag_list);
+    tls_config->sec_tag_list = sec_tag_list;
+    tls_config->session_cache = IS_ENABLED(CONFIG_MQTT_TLS_SESSION_CACHING) ?
+                                TLS_SESSION_CACHE_ENABLED :
+                                TLS_SESSION_CACHE_DISABLED;
+    tls_config->hostname = CONFIG_MQTT_BROKER_HOSTNAME;
+    tls_config->cert_nocopy = TLS_CERT_NOCOPY_NONE;
+    tls_config->set_native_tls = 0;
 
     return err;
 }
@@ -397,6 +418,10 @@ int fds_init(struct mqtt_client * p_client, struct pollfd * p_fds)
     if (p_client->transport.type == MQTT_TRANSPORT_NON_SECURE)
     {
         p_fds->fd = p_client->transport.tcp.sock;
+    }
+    else if (p_client->transport.type == MQTT_TRANSPORT_SECURE)
+    {
+        p_fds->fd = p_client->transport.tls.sock;
     }
     else
     {
@@ -438,6 +463,88 @@ int data_publish(struct mqtt_client * p_client, enum mqtt_qos qos, uint8_t * p_d
     {
         LOG_ERR("Failed to publish message, error: %d", err);
         return err;
+    }
+    return err;
+}
+
+/**@brief Function to store certificate in the modem if it does not exist.
+ *
+ * @note If the certificate already exists, the function checks if the certificate
+ *       in the modem matches the certificate in the application.
+ */
+int certificate_provision()
+{
+    int err;
+    bool exists;
+
+    /* Check if the certificate already exists in the modem. */
+    err = modem_key_mgmt_exists(CONFIG_MQTT_TLS_SEC_TAG,
+                                MODEM_KEY_MGMT_CRED_TYPE_CA_CHAIN,
+                                &exists);
+
+    if (err != 0)
+    {
+        LOG_ERR("Failed to check certificate, error: %d", err);
+    }
+
+    if (exists)
+    {
+        LOG_INF("Certificate already exists");
+
+        LOG_INF("Comparing credentials in modem with the certificate");
+        err = modem_key_mgmt_cmp(CONFIG_MQTT_TLS_SEC_TAG,
+                                 MODEM_KEY_MGMT_CRED_TYPE_CA_CHAIN,
+                                 CA_CERTIFICATE,
+                                 strlen(CA_CERTIFICATE));
+
+        if (err == 0)
+        {
+            LOG_INF("Credentials in modem match the certificate");
+        }
+        else if (err == 1)
+        {
+            LOG_INF("Credentials in modem do not match the certificate");
+            LOG_INF("Deleting the certificate from the modem");
+            err = modem_key_mgmt_delete(CONFIG_MQTT_TLS_SEC_TAG,
+                                        MODEM_KEY_MGMT_CRED_TYPE_CA_CHAIN);
+            if (err != 0)
+            {
+                LOG_ERR("Failed to delete certificate, error: %d", err);
+                return err;
+            }
+
+            /* Write the certificate to the modem. */
+            err = modem_key_mgmt_write(CONFIG_MQTT_TLS_SEC_TAG,
+                                       MODEM_KEY_MGMT_CRED_TYPE_CA_CHAIN,
+                                       CA_CERTIFICATE,
+                                       strlen(CA_CERTIFICATE));
+            if (err != 0)
+            {
+                LOG_ERR("Failed to provision certificate, error: %d", err);
+                return err;
+            }
+            LOG_INF("Certificate provisioned successfully");
+        }
+        else
+        {
+            LOG_ERR("Failed to compare certificate, error: %d", err);
+        }
+    }
+    else
+    {
+        LOG_INF("Certificate does not exist");
+
+        /* Write the certificate to the modem. */
+        err = modem_key_mgmt_write(CONFIG_MQTT_TLS_SEC_TAG,
+                                   MODEM_KEY_MGMT_CRED_TYPE_CA_CHAIN,
+                                   CA_CERTIFICATE,
+                                   strlen(CA_CERTIFICATE));
+        if (err != 0)
+        {
+            LOG_ERR("Failed to provision certificate, error: %d", err);
+            return err;
+        }
+        LOG_INF("Certificate provisioned successfully");
     }
     return err;
 }
